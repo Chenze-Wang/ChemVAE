@@ -715,7 +715,7 @@ def model_config_parser(config: dict) -> TransformerVAE:
     decoder_args = decoder_config['model_args']
     decoder = decoder_cls(**decoder_args)
 
-    regressor = nn.Linear(config['latent_dim'], config['num_properties'])
+    regressor = nn.Linear(config['latent_dim'], len(config['properties']))
     embedding_layer = nn.Embedding(**config['embedding_layer_args'])
 
     vae_kwargs = config.get('vae_kwargs', {})

@@ -252,18 +252,17 @@ def run_task(timestamp:str, task_name: str, device: torch.device|str|int):
     type_of_encoding = task_config['sup_params']['type_of_encoding']
 
     idxv = cdb.load_idxv(dataset_name, column=type_of_encoding)
+    max_seq_len = max([len(s) for s in idxv])
     appendices = cdb.load_appendices(dataset_name, type_of_encoding)
     alphabet = appendices['alphabet']
     properties = cdb.load_column(dataset_name, *task_config['properties'])
     
-    dataset_whole = database.IDXV_prop(idxv=idxv, properties=properties, normalize_props=False)
-    train_ratio, _ = task_config['train_val_split']
-    dataset_whole.shuffle()
-    train_set = dataset_whole.slice(slice(None, int(train_ratio*len(dataset_whole))))
-    val_set = dataset_whole.slice(slice(int(train_ratio*len(dataset_whole)), None))
-    
-    loader_train = 
-    loaders: dict[str: DataLoader] = {'train':loader_train, 'val': loader_val}
+    (loader_train, loader_val), mean, std = database.get_loaders(idxv, 
+                                                                 properties=properties,
+                                                                 batch_size=task_config['batch_size'],
+                                                                 split=task_config['train_val_split'],
+                                                                 mode='equal_length')
+    loaders = {'train': loader_train, 'val': loader_val}
 
     # load the model configs
     model_config: str = task_config['model_config']
@@ -271,13 +270,27 @@ def run_task(timestamp:str, task_name: str, device: torch.device|str|int):
     model_config = OmegaConf.load(os.path.join(paths['path_to_model_config'], model_config))
     
     # update some configs according to dataset
-    OmegaConf.update(model_config, 'num_properties', len(task_config['properties']))
+    # OmegaConf.update(model_config, 'num_properties', len(task_config['properties']))
     OmegaConf.update(model_config, 'embedding_layer_args.num_embeddings', len(alphabet))
-    OmegaConf.update(task_config, 'sup_params.alphabet', alphabet)
-    OmegaConf.update(task_config, 'sup_params.max_seq_len', pt_dataset.idxv.shape[1])
+    # save the dataset_name, type of encoding, alphabet, max_seq_len, properties into model_config
+    OmegaConf.update(model_config, 'dataset_name', dataset_name)
+    OmegaConf.update(model_config, 'type_of_encoding', type_of_encoding)
+    OmegaConf.update(model_config, 'alphabet', alphabet)
+    OmegaConf.update(model_config, 'properties', task_config['properties'])
+    OmegaConf.update(model_config, 'max_seq_len', max_seq_len)
+    # save the property mean and variance into the model_config
+    OmegaConf.update(model_config, 'prop_mean', mean.flatten().tolist())
+    OmegaConf.update(model_config, 'prop_std', std.flatten().tolist())
     
+    # transformer_encoder_flatten uses fixed length inputs
     if model_config['encoder']['backbone'] == 'transformer_encoder_flatten':
-        OmegaConf.update(model_config, 'encoder.model_args.seq_len', pt_dataset.idxv.shape[1])
+        OmegaConf.update(model_config, 'encoder.model_args.seq_len', max_seq_len)
+        
+    OmegaConf.update(task_config, 'sup_params.alphabet', alphabet)
+    # "sup_params.max_seq_len" means the maximal length when sampling from p(z) in evaluation
+    # don't confuse with "encoder.model_args.seq_len", which is only for transformer_encoder_fl, for it only accepts input of fixed length
+    OmegaConf.update(task_config, 'sup_params.max_seq_len', max_seq_len)
+
 
     vae = TVAE.model_config_parser(model_config)
 
@@ -329,14 +342,19 @@ def run_task(timestamp:str, task_name: str, device: torch.device|str|int):
     logger.info('Finished...')
 
 
-def get_pretrained_vae(timestamp:str, task_name: str|None=None) -> TVAE.TransformerVAE:
+def get_pretrained_vae(timestamp:str, 
+                       task_name: str|None=None, 
+                       from_dir:str|None=None) -> TVAE.TransformerVAE:
     if task_name is None:
         timestamp_tname = timestamp
     else:
         timestamp_tname = f'{timestamp}.{task_name}'
 
-    paths = OmegaConf.load(os.path.join(pwd, 'path.yml'))
-    path_to_results = paths['path_to_results']
+    if from_dir:
+        path_to_results = from_dir
+    else:
+        paths = OmegaConf.load(os.path.join(pwd, 'path.yml'))
+        path_to_results = paths['path_to_results']
     
     model_checkpoint = os.path.join(path_to_results, f'{timestamp_tname}.vae.state_dict.pt')
     model_config = os.path.join(path_to_results, f'{timestamp_tname}.model_config.yml')
@@ -348,28 +366,38 @@ def get_pretrained_vae(timestamp:str, task_name: str|None=None) -> TVAE.Transfor
     vae.load_state_dict(model_checkpoint)
     return vae
 
-def get_supplementaries(timestamp:str, task_name: str|None=None) -> dict:
+def get_supplementaries(timestamp:str, 
+                        task_name: str|None=None,
+                        from_dir:str|None=None) -> dict:
     
-    paths = OmegaConf.load(os.path.join(pwd, 'path.yml'))
+    if from_dir:
+        path_to_results = from_dir
+    else:
+        paths = OmegaConf.load(os.path.join(pwd, 'path.yml'))
+        path_to_results = paths['path_to_results']
+    
     if task_name is None:
         timestamp_tname = timestamp
     else:
         timestamp_tname = f'{timestamp}.{task_name}'
         
-    task_config = OmegaConf.load(os.path.join(paths['path_to_results'], f'{timestamp_tname}.task_config.yml'))
-    type_of_encoding = task_config['sup_params']['type_of_encoding']
-    dataset_name = task_config['dataset_name']
-    alphabet = task_config['sup_params']['alphabet']
-    max_seq_len = task_config['sup_params']['max_seq_len'] # longest sample in the data set
-    
-    model_config = OmegaConf.load(os.path.join(paths['path_to_results'], f'{timestamp_tname}.task_config.yml'))
-    properties_used = 
+    model_config = OmegaConf.load(os.path.join(path_to_results, f'{timestamp_tname}.model_config.yml'))
+    type_of_encoding = model_config['type_of_encoding']
+    dataset_name = model_config['dataset_name']
+    alphabet = model_config['alphabet']
+    max_seq_len = model_config['max_seq_len'] # longest sample in the data set
+    properties = model_config['properties']
+    prop_mean = torch.tensor([model_config['prop_mean']]) # (1, num_props)
+    prop_std = torch.tensor([model_config['prop_std']]) # (1, num_props)
     # get the mean and std of the properties
     
     return {'type_of_encoding': type_of_encoding,
             'alphabet': alphabet,
             'dataset_name': dataset_name,
-            'max_seq_len': max_seq_len}
+            'max_seq_len': max_seq_len,
+            'properties': properties,
+            'prop_mean': prop_mean,
+            'prop_std': prop_std}
 
 
 # unit testing: fitting QM9

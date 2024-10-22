@@ -71,12 +71,19 @@ class ChemDB():
         '''
         self.__lock = False
 
-    def load_column(self, table:str, /, *columns, order_by:str='id', ascending=True) -> pd.DataFrame:
+    def load_column(self, 
+                    table:str, /, 
+                    *columns, 
+                    order_by:str='id', 
+                    ascending=True,
+                    number:int=-1) -> pd.DataFrame:
         """Load a column of data from table
 
         Args:
             table (str): name of table in the database
             order_by (str, optional): key to determine the order of the samples, ascending. Defaults to 'id'.
+            ascending: output in ascending order or otherwise
+            number: if set to -1, select all entries. If 5, select the first 5 entries.
 
         Raises:
             ValueError: when designated column is not present.
@@ -93,7 +100,7 @@ class ChemDB():
                 raise ValueError(f'Column {col} not available')
         col_line = ','.join(columns)
         order = 'ASC' if ascending else 'DESC'
-        sql_cmd = f'SELECT id, {col_line} FROM {table} ORDER BY {order_by} {order}'
+        sql_cmd = f'SELECT id, {col_line} FROM {table} ORDER BY {order_by} {order} LIMIT {number}'
         df = pd.read_sql_query(sql=sql_cmd, con=self.con, index_col='id')
         return df
 
@@ -311,7 +318,7 @@ class IDXV_prop(Dataset):
                  idxv: Tensor|list[Tensor], 
                  properties: pd.DataFrame|np.ndarray|Tensor, 
                  prop_dtype=torch.float32,
-                 normalize_props = True):
+                 standardize_props = True):
         '''
         Dataset class for padded idxv!!!
         '''
@@ -330,82 +337,124 @@ class IDXV_prop(Dataset):
         else:
             raise Exception(f'type {type(properties)} for argument properties not supported.')
 
-        self.has_normalized = False
-        if normalize_props:
+        self.has_standardized = False
+        if standardize_props:
             self.prop_mean = torch.mean(self.prop_tensor, dim=0, keepdim=True)
             self.prop_std = torch.std(self.prop_tensor, dim=0, keepdim=True)
             self.prop_tensor = (self.prop_tensor - self.prop_mean) / self.prop_std
-            self.has_normalized = True
+            self.has_standardized = True
 
     def __getitem__(self, i: int):
-        '''
-        WARNING: If a slice/Tensor is passed in, only return the sliced/indexed data, not a new dataset
-        '''
         return self.idxv[i], self.prop_tensor[i]
-        
-    def slice(self, i: slice):
-        '''
-        Return a slice of itself.
-        '''
-        return IDXV_prop(self.idxv[i], self.prop_tensor[i], normalize_props=False)
     
-    def normalize(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.has_normalized:
-            warnings.warn("dataset already normalized, skipping this normalization")
-            return self.prop_mean, self.prop_std
-        self.prop_mean = torch.mean(self.prop_tensor, dim=0, keepdim=True)
-        self.prop_std = torch.std(self.prop_tensor, dim=0, keepdim=True)
+    def standardize_properties(self, 
+                               mean:Tensor|None=None, 
+                               std:Tensor|None=None):
+        """Standardize the properties. 
+        If arguments are provided, standadize the properties with specified mean and std.
+
+        Args:
+            mean (Tensor, optional): Must 1-D or shape of (1, data_size) Defaults to None.
+            std (Tensor, optional): Must 1-D or shape of (1, data_size) Defaults to None.
+        """        
+        if mean is None:
+            assert std is None
+            self.prop_mean = torch.mean(self.prop_tensor, dim=0, keepdim=True)
+            self.prop_std = torch.std(self.prop_tensor, dim=0, keepdim=True)
+            self.prop_tensor = (self.prop_tensor - self.prop_mean) / self.prop_std
+            self.has_standardized = True
+            return
+        
+        assert std is not None
+        if len(mean.shape) == 1:
+            assert len(std.shape) == 1
+            mean = mean.unsqueeze(0)
+            std = std.unsqueeze(0)
+        else:
+            assert (len(mean.shape) == 2) and (len(std.shape) == 2)
+            assert (mean.shape[0] == 1) and (std.shape[0] == 1)
+        
+        assert torch.all(std>0.0)
+        
+        self.prop_mean = mean
+        self.prop_std = std
         self.prop_tensor = (self.prop_tensor - self.prop_mean) / self.prop_std
-        self.has_normalized = True
-        return self.prop_mean, self.prop_std
                 
     def __len__(self):
         return self.idxv.shape[0]
-    
-    def shuffle(self, seed:int=1024):
-        rng = np.random.RandomState(seed=seed)
-        shuf = rng.permutation(self.idxv.shape[0])
-        self.idxv = self.idxv[shuf]
-        self.prop_tensor = self.prop_tensor[shuf]
 
 
 class IDXVv_prop(Dataset):
-    def __init__(self, seqs: pd.Series | list[Tensor], props: pd.DataFrame|np.ndarray|Tensor, prop_dtype=torch.float32):
-        '''
-        Dataset class for unpadded sequences
+    def __init__(self,
+                idxv_list: list[Tensor], 
+                properties: pd.DataFrame|np.ndarray|Tensor, 
+                prop_dtype=torch.float32,
+                standardize_props = True):
+        """Dataset class for unpadded sequences
         'IDXVv', v stands for variable length
-        '''
+
+        """        
         super().__init__()
-        raise Exception('IDXVv_prop class still under construction')
-        if isinstance(seqs, pd.Series):
-            # convert each idxv:list to tensor at initializaiton, avoid repetitive casting
-            self.sequencs_tensor_list = [tensor(i, dtype=torch.long) for i in seqs]
-        elif isinstance(seqs, list):
-            self.sequencs_tensor_list = seqs
-        else:
-            raise Exception(f'{type(seqs)} as argument seqs not supported')
         
-        if isinstance(props, pd.DataFrame):
-            self.prop_tensor = tensor(props.values, dtype=prop_dtype)
-        elif isinstance(props, Tensor):
-            self.prop_tensor = props.to(dtype=prop_dtype)
-        elif isinstance(props, np.ndarray):
-            self.prop_tensor = tensor(props, dtype=prop_dtype)
+        if isinstance(idxv_list, list) and isinstance(idxv_list[0], Tensor):
+            pass
         else:
-            raise Exception(f'{type(props)} as argument prop_df not supported')
+            raise ValueError(f'input type of idxv is not supported. check the entries in it')
+        self.idxv_list = idxv_list
+        if isinstance(properties, pd.DataFrame):
+            self.prop_tensor: tensor = tensor(properties.values, dtype=prop_dtype)
+        elif isinstance(properties, np.ndarray):
+            self.prop_tensor = tensor(properties, dtype=prop_dtype)
+        elif isinstance(properties, Tensor):
+            self.prop_tensor = properties.to(dtype=prop_dtype)
+        else:
+            raise Exception(f'type {type(properties)} for argument properties not supported.')
         
-        self.prop_mean = torch.mean(self.prop_tensor, dim=0, keepdim=True)
-        self.prop_std = torch.std(self.prop_tensor, dim=0, keepdim=True)
-        self.prop_tensor = (self.prop_tensor - self.prop_mean) / self.prop_std
+        self.has_standardized = False
+        if standardize_props:
+            self.prop_mean = torch.mean(self.prop_tensor, dim=0, keepdim=True)
+            self.prop_std = torch.std(self.prop_tensor, dim=0, keepdim=True)
+            self.prop_tensor = (self.prop_tensor - self.prop_mean) / self.prop_std
+            self.has_standardized = True
 
     def __getitem__(self, i: int):
-        return (self.sequencs_tensor_list[i], self.prop_tensor[i])
-    
-    def slice(self, i: slice):
-        return IDXVv_prop(self.sequencs_tensor_list[i], self.prop_tensor[i])
+        return (self.idxv_list[i], self.prop_tensor[i])
         
     def __len__(self):
-        return len(self.sequencs_tensor_list)
+        return len(self.idxv_list)
+    
+    def standardize_properties(self, 
+                               mean:Tensor|None=None, 
+                               std:Tensor|None=None):
+        """Standardize the properties. 
+        If arguments are provided, standadize the properties with specified mean and std.
+
+        Args:
+            mean (Tensor, optional): Must 1-D or shape of (1, data_size) Defaults to None.
+            std (Tensor, optional): Must 1-D or shape of (1, data_size) Defaults to None.
+        """        
+        if mean is None:
+            assert std is None
+            self.prop_mean = torch.mean(self.prop_tensor, dim=0, keepdim=True)
+            self.prop_std = torch.std(self.prop_tensor, dim=0, keepdim=True)
+            self.prop_tensor = (self.prop_tensor - self.prop_mean) / self.prop_std
+            self.has_standardized = True
+            return
+        
+        assert std is not None
+        if len(mean.shape) == 1:
+            assert len(std.shape) == 1
+            mean = mean.unsqueeze(0)
+            std = std.unsqueeze(0)
+        else:
+            assert (len(mean.shape) == 2) and (len(std.shape) == 2)
+            assert (mean.shape[0] == 1) and (std.shape[0] == 1)
+        
+        assert torch.all(std>0.0)
+        
+        self.prop_mean = mean
+        self.prop_std = std
+        self.prop_tensor = (self.prop_tensor - self.prop_mean) / self.prop_std
 
     @staticmethod
     def _collate_fn(batch: tuple):
@@ -422,39 +471,141 @@ class IDXVv_prop(Dataset):
         props = torch.vstack(props)
         return padded_sequences, props
 
-# generate pytorch dataloaders from a IDXVv_prop dataset
-def get_loaders(dataset: IDXV_prop|IDXVv_prop, batch_size: int, split:list[float] = [0.8, 0.2]):
-    '''
-    args
-        split: the splitting percentage of the data loaders
-        split should sum up to 1.0
-    return
-        a number of pytorch dataloaders, num = len(split)
-    '''
-    if sum(split) != 1.0:
-        raise Exception('input should sum up to 1.0')
-    
-    nums = [int(i*len(dataset)) for i in split]
-    if 0 in nums:
-        raise Exception('specified percentage too small, cannot assign at least one sample for a split')
-    
-    dataset.shuffle()
+# generate pytorch dataloaders from idxvs and properties
+def get_loaders(idxv:Tensor|list[Tensor], 
+                properties:Tensor|np.ndarray|pd.DataFrame, 
+                batch_size: int, 
+                split:float = 0.8,
+                seed:int=1024,
+                prop_dtype:torch.dtype=torch.float,
+                mode:str='equal_length') -> tuple[list[DataLoader], Tensor, Tensor]:
+    """Constructs train and eval DataLoaders from raw data.
 
+    Args:
+        idxv (Tensor | list[Tensor]): The index vector tensor, dtype is torch.long
+            Or a list of idxv Tensors
+            
+        properties (Tensor | np.ndarray): the property values, corresponding to each idxv. 
+            *Note: no need to standardize ahead, this function handles the it.
+            
+        batch_size (int): batch size for both the train loader, and the eval loader
+        
+        split float: portion of the training set. Must be strictly smaller than 1.0
+            
+        seed: the seed to generate random partition of data
+        
+        prop_dtype: the data type to use on the properties
+        
+        mode: choose between "equal_length" and "variable_length". 
+            "equal_length" mode: we pad all the idxv so that they all have same length as the longest sample.
+            "variable_length" mode: we keep samples of variable length in a list, 
+                only pad they to equal length in collate_fn.
+
+    Raises:
+        ValueError: If the split do not sum up to 1.
+        Exception: If the portion in split is too small that the size of its data set becomes 0.
+
+    Returns:
+        list[DataLoader]: loader_train and loader_val
+        Tensor, Tensor: mean and std of properties in the training set
+    """
+    assert len(idxv) == len(properties)
+    assert idxv[0].dtype is torch.long
+    
+    total_num = len(idxv)
+    
+    if not (0.0<split<1.0):
+        raise ValueError('split should be a fraction between 0.0 and 1.0')
+    
+    if isinstance(properties, pd.DataFrame):
+        prop_tensor = tensor(properties.values, dtype=prop_dtype)
+    elif isinstance(properties, np.ndarray):
+        prop_tensor = tensor(properties, dtype=prop_dtype)
+    elif isinstance(properties, Tensor):
+        prop_tensor = properties.to(dtype=prop_dtype)
+    else:
+        raise ValueError(f'type {type(properties)} for argument [properties] not supported.')
+    
+    '''
+    def shuffle(self, seed:int=1024):
+        rng = np.random.RandomState(seed=seed)
+        shuf = rng.permutation(self.idxv.shape[0])
+        self.idxv = self.idxv[shuf]
+        self.prop_tensor = self.prop_tensor[shuf]
+    '''
+    # shuffle the raw samples
+    rng = np.random.RandomState(seed=seed)
+    shuffle = rng.permutation(total_num)
+    if isinstance(idxv, Tensor):
+        shuffled_idxv = idxv[shuffle]
+    elif isinstance(idxv, list):
+        shuffled_idxv = [idxv[i] for i in shuffle]
+    else:
+        raise ValueError((f'type {type(idxv)} for argument [idxv] not supported.'))
+        
+    shuffled_prop_tensor = prop_tensor[shuffle]
+    
+    num_train = int(total_num*split)
+    if (num_train==0) or (num_train==total_num):
+        raise Exception(f'split {split} is too close to 0 or 1. Less than one sample in train/val set')
+
+    idxv_train = shuffled_idxv[:num_train]
+    idxv_val = shuffled_idxv[num_train:]
+    prop_train = shuffled_prop_tensor[:num_train]
+    prop_val = shuffled_prop_tensor[num_train:]
     loaders = []
     start = 0
-    if '_collate_fn' in dir(dataset):
-        for num in nums:
-            loaders.append(DataLoader(dataset.slice(slice(start, start+num)), 
-                                    batch_size=batch_size, shuffle=True, 
-                                    collate_fn=dataset._collate_fn))
-            start+=num
+    if mode == 'variable_length':
+        train_set = IDXVv_prop(idxv_list=idxv_train, 
+                               properties=prop_train, 
+                               prop_dtype=prop_dtype, 
+                               standardize_props=True)
+        
+        loaders.append(DataLoader(train_set, 
+                                  batch_size=batch_size, 
+                                  shuffle=True, 
+                                  collate_fn=IDXVv_prop._collate_fn,
+                                  num_workers=16))
+        
+        val_set = IDXVv_prop(idxv_list=idxv_val, 
+                             properties=prop_val, 
+                             prop_dtype=prop_dtype, 
+                             standardize_props=False)
+        
+        # standardize the val set with training mean and std.
+        val_set.standardize_properties(train_set.prop_mean, train_set.prop_std)
+        loaders.append(DataLoader(val_set, 
+                                  batch_size=batch_size, 
+                                  shuffle=True, 
+                                  collate_fn=IDXVv_prop._collate_fn,
+                                  num_workers=16))
+    elif mode=='equal_length':
+        train_set = IDXV_prop(idxv=idxv_train, 
+                               properties=prop_train, 
+                               prop_dtype=prop_dtype, 
+                               standardize_props=True)
+        
+        loaders.append(DataLoader(train_set, 
+                                  batch_size=batch_size, 
+                                  shuffle=True,
+                                  num_workers=16))
+        
+        val_set = IDXV_prop(idxv=idxv_val, 
+                             properties=prop_val, 
+                             prop_dtype=prop_dtype, 
+                             standardize_props=False)
+        
+        # standardize the val set with training mean and std.
+        val_set.standardize_properties(train_set.prop_mean, train_set.prop_std)
+        loaders.append(DataLoader(val_set, 
+                                  batch_size=batch_size, 
+                                  shuffle=True,
+                                  num_workers=16))
     else:
-        for num in nums:
-            loaders.append(DataLoader(dataset.slice(slice(start, start+num)), 
-                                    batch_size=batch_size, shuffle=True))
-            start+=num
+        raise Exception(f'mode {mode} is not supported')
+        
     
-    return loaders
+    return loaders, train_set.prop_mean, train_set.prop_std
 
 
 if __name__=='__main__':
@@ -465,22 +616,23 @@ if __name__=='__main__':
     # alp, atoi = cdb.build_alphabet_atoi(table=table, column='SELFIES', tokenizer=sf.split_selfies)
     appendices = cdb.load_appendices(table=table, column='SELFIES')
     atoi = appendices['atoi']
-    idxv = cdb.load_idxv(table=table, column='SELFIES', tokenizer=sf.split_selfies)
-    df = cdb.load_column(table, 'SELFIES')
+    idxv = cdb.load_idxv(table=table, column='SELFIES', tokenizer=sf.split_selfies)[:10]
+    df = cdb.load_column(table, 'SELFIES', number=10)
+
+    prop = cdb.load_column(table, 'logP', 'QED', number=10)
+    
     print(df.tail())
+    print(prop.tail())
+    
     print(idxv[-5:])
     print(atoi)
-
-    # prop = cdb.load_column(table, 'logP', 'SAS')
-    # dataset = IDXV_prop(idxv, properties=prop)
-    # train, val = get_loaders(dataset=dataset, batch_size=64)
-    # for x, y in train:
-    #     print(x.shape)
-    #     print(y.shape)
-    #     print(y.mean())
-    #     print(y.std())
-    #     break
-
+    
+    (loader_train, loader_val), mean, std = get_loaders(idxv, prop, 3, 0.6, mode='variable_length')
+    for x, y in loader_train:
+        print(x)
+        print(y*std + mean)
+        break
+    
 # cur.execute('''CREATE TABLE qm9(
 #     id INTEGER PRIMARY KEY,
 #     SMILES TEXT NOT NULL UNIQUE,
